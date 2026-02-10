@@ -12,15 +12,25 @@ use panic_probe as _;
 
 // Provide an alias for our BSP so we can switch targets quickly.
 // Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
-use rp_pico as bsp;
+use rp_pico::{
+    self as bsp,
+    hal::{
+        fugit::RateExtU32 as _,
+        gpio::{FunctionPio0, FunctionUart},
+        pio::{PIOBuilder, PIOExt as _},
+        uart::{DataBits, StopBits, UartConfig, UartPeripheral},
+    },
+};
 // use sparkfun_pro_micro_rp2040 as bsp;
 
 use bsp::hal::{
-    clocks::{Clock, init_clocks_and_plls},
+    clocks::{init_clocks_and_plls, Clock},
     pac,
     sio::Sio,
     watchdog::Watchdog,
 };
+
+use pio_proc::pio_asm;
 
 #[entry]
 fn main() -> ! {
@@ -64,14 +74,42 @@ fn main() -> ! {
     // in series with the LED.
     let mut led_pin = pins.led.into_push_pull_output();
 
-    loop {
-        info!("on!");
-        led_pin.set_high().unwrap();
-        delay.delay_ms(500);
-        info!("off!");
-        led_pin.set_low().unwrap();
-        delay.delay_ms(500);
-    }
+    let uart_tx_pin = pins.gpio0.into_function::<FunctionUart>();
+    let uart_tx_pin_num = uart_tx_pin.id().num;
+    let uart_rx_pin = pins.gpio1.into_function::<FunctionUart>();
+    let uart = UartPeripheral::new(pac.UART0, (uart_tx_pin, uart_rx_pin), &mut pac.RESETS)
+        .enable(
+            UartConfig::new(2400_u32.Hz(), DataBits::Eight, None, StopBits::One),
+            clocks.peripheral_clock.freq(),
+        )
+        .unwrap();
+
+    let ir_tx_pin = pins.gpio2.into_function::<FunctionPio0>();
+    let ir_tx_pin_num = ir_tx_pin.id().num;
+
+    let (mut pio0, sm0, _, _, _) = pac.PIO0.split(&mut pac.RESETS);
+
+    let program = pio_asm!(
+        "set pindirs, 1",
+        "loop:",
+        "    jmp pin idle",
+        "    set pins, 1 [31]",
+        "    set pins, 0 [31]",
+        "    jmp loop",
+        "idle:",
+        "    set pins, 0",
+        "    jmp loop",
+    );
+    let installed = pio0.install(&program.program).unwrap();
+    let (sm, _rx, _tx) = PIOBuilder::from_installed_program(installed)
+        .set_pins(ir_tx_pin_num, 1)
+        .jmp_pin(uart_tx_pin_num)
+        .clock_divisor_fixed_point(51, 102)
+        .build(sm0);
+
+    let _sm = sm.start();
+
+    loop {}
 }
 
 // End of file

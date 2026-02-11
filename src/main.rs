@@ -16,10 +16,15 @@ use rp_pico::{
     self as bsp,
     hal::{
         fugit::RateExtU32 as _,
-        gpio::{FunctionPio0, FunctionUart},
+        gpio::{
+            bank0::{Gpio0, Gpio1},
+            FunctionPio0, FunctionUart, Pin, PullDown, PullUp,
+        },
+        pac::interrupt,
         pio::{PIOBuilder, PIOExt as _},
-        uart::{DataBits, StopBits, UartConfig, UartPeripheral},
+        uart::{self, DataBits, StopBits, UartConfig, UartPeripheral},
     },
+    pac::{Interrupt, NVIC, UART0},
 };
 // use sparkfun_pro_micro_rp2040 as bsp;
 
@@ -30,13 +35,21 @@ use bsp::hal::{
     watchdog::Watchdog,
 };
 
+use heapless::spsc::{self, Queue};
 use pio_proc::pio_asm;
+
+type Uart0Tx = Pin<Gpio0, FunctionUart, PullDown>;
+type Uart0Rx = Pin<Gpio1, FunctionUart, PullUp>;
+type Uart0Reader = uart::Reader<UART0, (Uart0Tx, Uart0Rx)>;
+static mut UART_RX: Option<Uart0Reader> = None;
+static mut UART_RX_BUFFER: Queue<u8, 128> = Queue::new();
+static mut UART_RX_BUFFER_PROD: Option<spsc::Producer<'static, u8>> = None;
 
 #[entry]
 fn main() -> ! {
     info!("Program start");
     let mut pac = pac::Peripherals::take().unwrap();
-    let core = pac::CorePeripherals::take().unwrap();
+    let mut core = pac::CorePeripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let sio = Sio::new(pac.SIO);
 
@@ -76,13 +89,23 @@ fn main() -> ! {
 
     let uart_tx_pin = pins.gpio0.into_function::<FunctionUart>();
     let uart_tx_pin_num = uart_tx_pin.id().num;
-    let uart_rx_pin = pins.gpio1.into_function::<FunctionUart>();
-    let uart = UartPeripheral::new(pac.UART0, (uart_tx_pin, uart_rx_pin), &mut pac.RESETS)
+    let uart_rx_pin = pins
+        .gpio1
+        .into_pull_up_input()
+        .into_function::<FunctionUart>();
+    let mut uart = UartPeripheral::new(pac.UART0, (uart_tx_pin, uart_rx_pin), &mut pac.RESETS)
         .enable(
             UartConfig::new(2400_u32.Hz(), DataBits::Eight, None, StopBits::One),
             clocks.peripheral_clock.freq(),
         )
         .unwrap();
+    uart.enable_rx_interrupt();
+    let (uart_rx, _uart_tx) = uart.split();
+    let (uart_rx_prod, mut uart_rx_cons) = unsafe { UART_RX_BUFFER.split() };
+    unsafe {
+        UART_RX = Some(uart_rx);
+        UART_RX_BUFFER_PROD = Some(uart_rx_prod);
+    }
 
     let ir_tx_pin = pins.gpio2.into_function::<FunctionPio0>();
     let ir_tx_pin_num = ir_tx_pin.id().num;
@@ -109,7 +132,44 @@ fn main() -> ! {
 
     let _sm = sm.start();
 
-    loop {}
+    unsafe {
+        core.NVIC.set_priority(Interrupt::UART0_IRQ, 2);
+        NVIC::unmask(Interrupt::UART0_IRQ);
+    }
+
+    loop {
+        while let Some(_b) = uart_rx_cons.dequeue() {
+            info!("Received byte: {}", _b as char);
+        }
+    }
+}
+
+#[interrupt]
+fn UART0_IRQ() {
+    let mut buf = [0u8; 32];
+
+    let (rx, prod) = unsafe {
+        match (UART_RX.as_ref(), UART_RX_BUFFER_PROD.as_mut()) {
+            (Some(rx), Some(prod)) => (rx, prod),
+            _ => return,
+        }
+    };
+
+    loop {
+        match rx.read_raw(&mut buf) {
+            Ok(n) => {
+                for &b in &buf[..n] {
+                    let _ = prod.enqueue(b);
+                }
+            }
+            Err(nb::Error::WouldBlock) => break,
+            Err(nb::Error::Other(e)) => {
+                for &b in e.discarded {
+                    let _ = prod.enqueue(b);
+                }
+            }
+        }
+    }
 }
 
 // End of file

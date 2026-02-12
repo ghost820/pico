@@ -41,6 +41,8 @@ use pio_proc::pio_asm;
 type Uart0Tx = Pin<Gpio0, FunctionUart, PullDown>;
 type Uart0Rx = Pin<Gpio1, FunctionUart, PullUp>;
 type Uart0Reader = uart::Reader<UART0, (Uart0Tx, Uart0Rx)>;
+static mut UART_TX_BUFFER: Queue<u8, 128> = Queue::new();
+static mut UART_TX_BUFFER_CONS: Option<spsc::Consumer<'static, u8>> = None;
 static mut UART_RX: Option<Uart0Reader> = None;
 static mut UART_RX_BUFFER: Queue<u8, 128> = Queue::new();
 static mut UART_RX_BUFFER_PROD: Option<spsc::Producer<'static, u8>> = None;
@@ -101,8 +103,10 @@ fn main() -> ! {
         .unwrap();
     uart.enable_rx_interrupt();
     let (uart_rx, _uart_tx) = uart.split();
+    let (mut uart_tx_prod, uart_tx_cons) = unsafe { UART_TX_BUFFER.split() };
     let (uart_rx_prod, mut uart_rx_cons) = unsafe { UART_RX_BUFFER.split() };
     unsafe {
+        UART_TX_BUFFER_CONS = Some(uart_tx_cons);
         UART_RX = Some(uart_rx);
         UART_RX_BUFFER_PROD = Some(uart_rx_prod);
     }
@@ -170,6 +174,35 @@ fn UART0_IRQ() {
             }
         }
     }
+
+    let uart0 = unsafe { &*UART0::ptr() };
+    let cons = unsafe {
+        match UART_TX_BUFFER_CONS.as_mut() {
+            Some(c) => c,
+            None => return,
+        }
+    };
+
+    while !uart0.uartfr().read().txff().bit_is_set() {
+        if let Some(b) = cons.dequeue() {
+            uart0.uartdr().write(|w| unsafe { w.data().bits(b) });
+        } else {
+            break;
+        }
+    }
+
+    if !cons.is_empty() {
+        uart0.uartimsc().modify(|_, w| w.txim().set_bit());
+    } else {
+        uart0.uartimsc().modify(|_, w| w.txim().clear_bit());
+    }
+}
+
+fn uart_send(prod: &mut spsc::Producer<'static, u8>, data: &[u8]) {
+    for &b in data {
+        let _ = prod.enqueue(b);
+    }
+    NVIC::pend(Interrupt::UART0_IRQ);
 }
 
 // End of file

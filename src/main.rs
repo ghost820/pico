@@ -5,6 +5,7 @@
 #![no_main]
 
 use bsp::entry;
+use cortex_m::singleton;
 use defmt::*;
 use defmt_rtt as _;
 use embedded_hal::digital::OutputPin;
@@ -15,16 +16,10 @@ use panic_probe as _;
 use rp_pico::{
     self as bsp,
     hal::{
-        fugit::RateExtU32 as _,
-        gpio::{
-            bank0::{Gpio0, Gpio1},
-            FunctionPio0, FunctionUart, Pin, PullDown, PullUp,
-        },
-        pac::interrupt,
-        pio::{PIOBuilder, PIOExt as _},
-        uart::{self, DataBits, StopBits, UartConfig, UartPeripheral},
+        adc::AdcPin,
+        dma::{self, DMAExt as _},
+        Adc,
     },
-    pac::{Interrupt, NVIC, UART0},
 };
 // use sparkfun_pro_micro_rp2040 as bsp;
 
@@ -35,23 +30,13 @@ use bsp::hal::{
     watchdog::Watchdog,
 };
 
-use heapless::spsc::{self, Queue};
-use pio_proc::pio_asm;
-
-type Uart0Tx = Pin<Gpio0, FunctionUart, PullDown>;
-type Uart0Rx = Pin<Gpio1, FunctionUart, PullUp>;
-type Uart0Reader = uart::Reader<UART0, (Uart0Tx, Uart0Rx)>;
-static mut UART_TX_BUFFER: Queue<u8, 128> = Queue::new();
-static mut UART_TX_BUFFER_CONS: Option<spsc::Consumer<'static, u8>> = None;
-static mut UART_RX: Option<Uart0Reader> = None;
-static mut UART_RX_BUFFER: Queue<u8, 128> = Queue::new();
-static mut UART_RX_BUFFER_PROD: Option<spsc::Producer<'static, u8>> = None;
+const DSP_BUFFER_SIZE: usize = 1024;
 
 #[entry]
 fn main() -> ! {
     info!("Program start");
     let mut pac = pac::Peripherals::take().unwrap();
-    let mut core = pac::CorePeripherals::take().unwrap();
+    let core = pac::CorePeripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let sio = Sio::new(pac.SIO);
 
@@ -89,120 +74,41 @@ fn main() -> ! {
     // in series with the LED.
     let mut led_pin = pins.led.into_push_pull_output();
 
-    let uart_tx_pin = pins.gpio0.into_function::<FunctionUart>();
-    let uart_tx_pin_num = uart_tx_pin.id().num;
-    let uart_rx_pin = pins
-        .gpio1
-        .into_pull_up_input()
-        .into_function::<FunctionUart>();
-    let mut uart = UartPeripheral::new(pac.UART0, (uart_tx_pin, uart_rx_pin), &mut pac.RESETS)
-        .enable(
-            UartConfig::new(2400_u32.Hz(), DataBits::Eight, None, StopBits::One),
-            clocks.peripheral_clock.freq(),
-        )
-        .unwrap();
-    uart.enable_rx_interrupt();
-    let (uart_rx, _uart_tx) = uart.split();
-    let (mut uart_tx_prod, uart_tx_cons) = unsafe { UART_TX_BUFFER.split() };
-    let (uart_rx_prod, mut uart_rx_cons) = unsafe { UART_RX_BUFFER.split() };
-    unsafe {
-        UART_TX_BUFFER_CONS = Some(uart_tx_cons);
-        UART_RX = Some(uart_rx);
-        UART_RX_BUFFER_PROD = Some(uart_rx_prod);
-    }
+    let adc_fs_hz = 44100;
+    let adc_clk_hz = clocks.adc_clock.freq().to_Hz();
+    let adc_div = (adc_clk_hz / adc_fs_hz - 1) as u16;
+    let mut adc = Adc::new(pac.ADC, &mut pac.RESETS);
+    let mut adc_pin = AdcPin::new(pins.gpio26.into_floating_input()).unwrap();
+    let mut adc_fifo = adc
+        .build_fifo()
+        .clock_divider(adc_div, 0)
+        .set_channel(&mut adc_pin)
+        .enable_dma()
+        .start_paused();
 
-    let ir_tx_pin = pins.gpio2.into_function::<FunctionPio0>();
-    let ir_tx_pin_num = ir_tx_pin.id().num;
+    let dma_buf_a = singleton!(: [u16; DSP_BUFFER_SIZE] = [0; DSP_BUFFER_SIZE]).unwrap();
+    let dma_buf_b = singleton!(: [u16; DSP_BUFFER_SIZE] = [0; DSP_BUFFER_SIZE]).unwrap();
+    let dma = pac.DMA.split(&mut pac.RESETS);
+    let dma_transfer =
+        dma::double_buffer::Config::new((dma.ch0, dma.ch1), adc_fifo.dma_read_target(), dma_buf_a)
+            .start();
+    let mut dma_transfer = dma_transfer.write_next(dma_buf_b);
 
-    let (mut pio0, sm0, _, _, _) = pac.PIO0.split(&mut pac.RESETS);
-
-    let program = pio_asm!(
-        "set pindirs, 1",
-        "loop:",
-        "    jmp pin idle",
-        "    set pins, 1 [31]",
-        "    set pins, 0 [31]",
-        "    jmp loop",
-        "idle:",
-        "    set pins, 0",
-        "    jmp loop",
-    );
-    let installed = pio0.install(&program.program).unwrap();
-    let (sm, _rx, _tx) = PIOBuilder::from_installed_program(installed)
-        .set_pins(ir_tx_pin_num, 1)
-        .jmp_pin(uart_tx_pin_num)
-        .clock_divisor_fixed_point(51, 102)
-        .build(sm0);
-
-    let _sm = sm.start();
-
-    unsafe {
-        core.NVIC.set_priority(Interrupt::UART0_IRQ, 2);
-        NVIC::unmask(Interrupt::UART0_IRQ);
-    }
+    adc_fifo.resume();
 
     loop {
-        while let Some(_b) = uart_rx_cons.dequeue() {
-            info!("Received byte: {}", _b as char);
-        }
+        let (filled, next) = dma_transfer.wait();
+
+        dsp(filled);
+
+        dma_transfer = next.write_next(filled);
     }
 }
 
-#[interrupt]
-fn UART0_IRQ() {
-    let mut buf = [0u8; 32];
-
-    let (rx, prod) = unsafe {
-        match (UART_RX.as_ref(), UART_RX_BUFFER_PROD.as_mut()) {
-            (Some(rx), Some(prod)) => (rx, prod),
-            _ => return,
-        }
-    };
-
-    loop {
-        match rx.read_raw(&mut buf) {
-            Ok(n) => {
-                for &b in &buf[..n] {
-                    let _ = prod.enqueue(b);
-                }
-            }
-            Err(nb::Error::WouldBlock) => break,
-            Err(nb::Error::Other(e)) => {
-                for &b in e.discarded {
-                    let _ = prod.enqueue(b);
-                }
-            }
-        }
+fn dsp(samples: &[u16; DSP_BUFFER_SIZE]) {
+    for &s in samples {
+        // s & 0x0fff
     }
-
-    let uart0 = unsafe { &*UART0::ptr() };
-    let cons = unsafe {
-        match UART_TX_BUFFER_CONS.as_mut() {
-            Some(c) => c,
-            None => return,
-        }
-    };
-
-    while !uart0.uartfr().read().txff().bit_is_set() {
-        if let Some(b) = cons.dequeue() {
-            uart0.uartdr().write(|w| unsafe { w.data().bits(b) });
-        } else {
-            break;
-        }
-    }
-
-    if !cons.is_empty() {
-        uart0.uartimsc().modify(|_, w| w.txim().set_bit());
-    } else {
-        uart0.uartimsc().modify(|_, w| w.txim().clear_bit());
-    }
-}
-
-fn uart_send(prod: &mut spsc::Producer<'static, u8>, data: &[u8]) {
-    for &b in data {
-        let _ = prod.enqueue(b);
-    }
-    NVIC::pend(Interrupt::UART0_IRQ);
 }
 
 // End of file
